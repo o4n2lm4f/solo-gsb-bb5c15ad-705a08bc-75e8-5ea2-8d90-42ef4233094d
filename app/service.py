@@ -349,6 +349,98 @@ def release_lease(conn: sqlite3.Connection, token: str) -> dict:
     return _lease_row_to_dict(row)
 
 
+def resize_lease(
+    conn: sqlite3.Connection, token: str, target_prefix_len: int
+) -> dict:
+    """In-place shrink/grow of a live lease's CIDR.
+
+    Shrinking keeps the low-address aligned subnet containing the current
+    start address (which, for a shrink, is the block at the current start).
+    Growing snaps to the unique enclosing supernet of the target size and is
+    allowed only while it stays inside the pool and clear of reservations and
+    other active leases. Token and expires_at never change.
+    """
+    now = _now()
+    row = _find_lease(conn, token)
+    pool = _get_pool(conn, row["pool_id"])
+    # Locks are pool-scoped; sweep first so the status check is authoritative.
+    _sweep_pool(conn, row["pool_id"], now)
+    row = _find_lease(conn, token)
+    _require_live(row, now)
+
+    max_prefix = 32 if pool["version"] == 4 else 128
+    if (
+        isinstance(target_prefix_len, bool)
+        or not isinstance(target_prefix_len, int)
+        or target_prefix_len < 0
+        or target_prefix_len > max_prefix
+    ):
+        raise ApiError(
+            422,
+            f"target_prefix_len must be between 0 and {max_prefix} "
+            f"for an IPv{pool['version']} lease",
+        )
+
+    current = _parse422(row["cidr"])
+    current_len = current.prefixlen
+
+    # Same prefix: no-op success — token/expiry unchanged, no audit event.
+    if target_prefix_len == current_len:
+        return _lease_row_to_dict(row)
+
+    # Unique aligned block of the target size covering the current start.
+    block_size = 1 << (max_prefix - target_prefix_len)
+    new_start = int(row["start_addr"]) & ~(block_size - 1)
+    new_end = new_start + block_size
+    new_cidr = collapse([(new_start, new_end)], pool["version"])[0]
+
+    if new_start < int(pool["start_addr"]) or new_end > int(pool["end_addr"]):
+        raise ApiError(
+            409,
+            f"resized network {new_cidr} extends outside pool {pool['cidr']}",
+        )
+
+    # A shrink (larger prefix) stays strictly inside the current lease, whose
+    # space was clear of reservations and other leases when it was handed out;
+    # only growth (smaller prefix) reaches addresses held by others.
+    if target_prefix_len < current_len:
+        for r_start, r_end in _reservation_occupancy(conn, row["pool_id"]):
+            if overlaps(new_start, new_end, r_start, r_end):
+                raise ApiError(
+                    409, f"resized network {new_cidr} overlaps a reservation"
+                )
+        others = conn.execute(
+            "SELECT start_addr, end_addr FROM leases "
+            "WHERE pool_id = ? AND id != ? AND status = 'active' "
+            "AND expires_at > ?",
+            (row["pool_id"], row["id"], now),
+        ).fetchall()
+        for other in others:
+            if overlaps(
+                new_start, new_end, int(other["start_addr"]), int(other["end_addr"])
+            ):
+                raise ApiError(
+                    409, f"resized network {new_cidr} overlaps an active lease"
+                )
+
+    # Token, status and expires_at are deliberately left untouched.
+    conn.execute(
+        "UPDATE leases SET cidr = ?, start_addr = ?, end_addr = ? WHERE id = ?",
+        (new_cidr, str(new_start), str(new_end), row["id"]),
+    )
+    audit.append_event(
+        conn,
+        action=audit.RESIZE,
+        lease_id=row["id"],
+        pool_id=row["pool_id"],
+        cidr=new_cidr,
+        occurred_at=now,
+        details={"before_cidr": row["cidr"], "after_cidr": new_cidr},
+    )
+    row = conn.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone()
+    return _lease_row_to_dict(row)
+
+
 def get_lease(conn: sqlite3.Connection, token: str) -> dict:
     now = _now()
     row = _find_lease(conn, token)

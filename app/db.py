@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS leases (
 -- appended inside the same BEGIN IMMEDIATE transaction as the change.
 CREATE TABLE IF NOT EXISTS audit_events (
     seq         INTEGER PRIMARY KEY,  -- 1, 2, 3, ... assigned under the write lock
-    action      TEXT NOT NULL,        -- allocate | renew | release | expire
+    action      TEXT NOT NULL,        -- allocate | renew | release | resize | expire
     lease_id    INTEGER NOT NULL,
     pool_id     INTEGER NOT NULL,
     cidr        TEXT NOT NULL,

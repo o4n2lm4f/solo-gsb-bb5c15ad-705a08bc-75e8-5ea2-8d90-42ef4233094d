@@ -1,8 +1,9 @@
 """Append-only, hash-chained audit log for lease lifecycle events.
 
-Every successful allocate / renew / release / expire appends exactly one
-event, inside the same ``BEGIN IMMEDIATE`` transaction as the state change
-itself — so a rolled-back operation never leaves an event behind.
+Every successful allocate / renew / release / resize / expire appends
+exactly one event, inside the same ``BEGIN IMMEDIATE`` transaction as the
+state change itself — so a rolled-back operation never leaves an event
+behind.
 
 Each event stores ``seq`` (1, 2, 3, ...), the action, lease/pool ids, the
 CIDR, the event time, a JSON ``details`` object, ``prev_hash`` and ``hash``.
@@ -25,6 +26,7 @@ GENESIS_PREV_HASH = "0" * 64
 ALLOCATE = "allocate"
 RENEW = "renew"
 RELEASE = "release"
+RESIZE = "resize"
 EXPIRE = "expire"
 
 # Fields covered by the hash (everything except prev_hash / hash).
