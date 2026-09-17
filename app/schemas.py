@@ -38,6 +38,10 @@ class RenewRequest(BaseModel):
     ttl_seconds: int | None = Field(None, ge=1, le=2**31 - 1)
 
 
+class ResizeRequest(BaseModel):
+    target_prefix_len: int = Field(..., ge=0, le=128, examples=[26])
+
+
 class LeaseOut(BaseModel):
     id: int
     pool_id: int

@@ -21,6 +21,7 @@ from .schemas import (
     RenewRequest,
     ReservationCreate,
     ReservationOut,
+    ResizeRequest,
 )
 
 
@@ -125,6 +126,14 @@ def renew_lease(
 def release_lease(token: str, db: sqlite3.Connection = Depends(get_db)) -> dict:
     with write_tx(db):
         return service.release_lease(db, token)
+
+
+@app.put("/leases/{token}/resize", response_model=LeaseOut)
+def resize_lease(
+    token: str, body: ResizeRequest, db: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    with write_tx(db):
+        return service.resize_lease(db, token, body.target_prefix_len)
 
 
 # ---------- audit chain ----------

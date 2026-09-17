@@ -313,3 +313,173 @@ def test_audit_verify_detects_broken_linkage(client):
 def test_audit_empty_chain_is_valid(client):
     assert client.get("/audit/events").json() == []
     assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+# ---------- resize ----------
+
+def test_resize_shrink_keeps_low_subnet_and_identity(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 26, "ttl_seconds": 3600}
+    ).json()
+    assert lease["cidr"] == "10.0.0.0/26"
+
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 28})
+    assert r.status_code == 200
+    out = r.json()
+    assert out["cidr"] == "10.0.0.0/28"  # low subnet, same start address
+    assert out["id"] == lease["id"]
+    assert out["token"] == lease["token"]  # token unchanged
+    assert out["expires_at"] == lease["expires_at"]  # expiry unchanged
+
+    # the released upper part of the old block is free again
+    ov = client.get(f"/pools/{pid}").json()
+    assert ov["free_cidrs"] == [
+        "10.0.0.16/28",
+        "10.0.0.32/27",
+        "10.0.0.64/26",
+        "10.0.0.128/25",
+    ]
+    # and can be handed out to a new lease
+    r = client.post(f"/pools/{pid}/leases", json={"prefix_len": 28})
+    assert r.status_code == 201
+    assert r.json()["cidr"] == "10.0.0.16/28"
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "resize", "allocate"]
+    resize = events[1]
+    assert resize["lease_id"] == lease["id"]
+    assert resize["cidr"] == "10.0.0.0/28"
+    assert resize["details"] == {
+        "before_cidr": "10.0.0.0/26",
+        "after_cidr": "10.0.0.0/28",
+    }
+    assert lease["token"] not in str(resize)
+    _assert_chain_linkage(events)
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_resize_grow_into_free_supernet(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    first = client.post(f"/pools/{pid}/leases", json={"prefix_len": 26}).json()
+    second = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    assert first["cidr"] == "10.0.0.0/26"
+    assert second["cidr"] == "10.0.0.64/27"
+
+    # the unique /26 enclosing 10.0.0.64/27 is 10.0.0.64/26 — free, so it grows
+    r = client.put(f"/leases/{second['token']}/resize", json={"target_prefix_len": 26})
+    assert r.status_code == 200
+    out = r.json()
+    assert out["cidr"] == "10.0.0.64/26"
+    assert out["token"] == second["token"]
+    assert out["expires_at"] == second["expires_at"]
+
+    ov = client.get(f"/pools/{pid}").json()
+    assert ov["free_cidrs"] == ["10.0.0.128/25"]
+
+
+def test_resize_grow_conflict_with_active_lease(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    client.post(f"/pools/{pid}/leases", json={"prefix_len": 27})  # 10.0.0.0/27
+    b = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    assert b["cidr"] == "10.0.0.32/27"
+
+    # growing b to /26 needs 10.0.0.0/26, which overlaps the first lease
+    r = client.put(f"/leases/{b['token']}/resize", json={"target_prefix_len": 26})
+    assert r.status_code == 409
+    # failed resize leaves the lease unchanged and appends no event
+    assert client.get(f"/leases/{b['token']}").json()["cidr"] == "10.0.0.32/27"
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "allocate"]
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_resize_grow_conflict_with_reservation(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    client.post(f"/pools/{pid}/reservations", json={"cidr": "10.0.0.64/26"})
+    lease = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    assert lease["cidr"] == "10.0.0.0/27"
+
+    # /25 supernet (10.0.0.0/25) would swallow the reservation
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 25})
+    assert r.status_code == 409
+    # /26 (10.0.0.0/26) stops short of it and succeeds
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 26})
+    assert r.status_code == 200
+    assert r.json()["cidr"] == "10.0.0.0/26"
+
+
+def test_resize_grow_outside_pool_rejected(client):
+    pid = _create_pool(client, cidr="10.0.0.0/25")
+    lease = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    # the /24 supernet escapes the /25 pool
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 24})
+    assert r.status_code == 409
+    assert client.get(f"/leases/{lease['token']}").json()["cidr"] == "10.0.0.0/27"
+
+
+def test_resize_invalid_prefix_422(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    url = f"/leases/{lease['token']}/resize"
+    assert client.put(url, json={"target_prefix_len": 33}).status_code == 422
+    assert client.put(url, json={"target_prefix_len": -1}).status_code == 422
+    assert client.put(url, json={"target_prefix_len": 129}).status_code == 422
+    assert client.put(url, json={}).status_code == 422
+    # nothing recorded for rejected requests
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate"]
+
+
+def test_resize_same_prefix_is_noop_without_event(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 27})
+    assert r.status_code == 200
+    assert r.json() == lease
+    assert [e["action"] for e in client.get("/audit/events").json()] == ["allocate"]
+
+
+def test_resize_requires_active_lease(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = client.post(f"/pools/{pid}/leases", json={"prefix_len": 27}).json()
+    client.post(f"/leases/{lease['token']}/release")
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 28})
+    assert r.status_code == 409
+    assert client.put("/leases/nope/resize", json={"target_prefix_len": 28}).status_code == 404
+
+
+def test_resize_expired_lease_409(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 27, "ttl_seconds": 1}
+    ).json()
+    time.sleep(1.2)
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 28})
+    assert r.status_code == 409
+
+
+def test_resize_ipv6(client):
+    pid = _create_pool(client, "v6", "2001:db8::/32")
+    lease = client.post(f"/pools/{pid}/leases", json={"prefix_len": 64}).json()
+    assert lease["cidr"] == "2001:db8::/64"
+
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 48})
+    assert r.status_code == 200
+    assert r.json()["cidr"] == "2001:db8::/48"
+
+    r = client.put(f"/leases/{lease['token']}/resize", json={"target_prefix_len": 56})
+    assert r.status_code == 200
+    assert r.json()["cidr"] == "2001:db8::/56"
+
+    assert client.put(
+        f"/leases/{lease['token']}/resize", json={"target_prefix_len": 129}
+    ).status_code == 422
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "resize", "resize"]
+    assert events[1]["details"] == {
+        "before_cidr": "2001:db8::/64",
+        "after_cidr": "2001:db8::/48",
+    }
+    _assert_chain_linkage(events)

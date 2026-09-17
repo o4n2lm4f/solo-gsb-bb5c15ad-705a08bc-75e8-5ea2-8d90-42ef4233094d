@@ -35,6 +35,21 @@ docker compose up -d --build
 - 查询池详情返回活动租约、保留段，以及把所有空闲空间合并后的**最简 CIDR 集合**
   （相邻块合并、每段贪心取最大对齐块）。
 
+## 租约原地缩扩容
+
+`PUT /leases/{token}/resize`，请求体 `{"target_prefix_len": <int>}`：
+
+- 仅**活动租约**可操作；已释放/过期租约返回 `409`，未知令牌返回 `404`。
+- **缩容**（目标前缀更长）：保留原起始地址所在的**低地址子网**，其余空间
+  立即回到池中可再分配。
+- **扩容**（目标前缀更短）：取**唯一包住当前网段**的目标超网；仅当其仍位于
+  原池内、且不与保留段或其他活动租约重叠时成功，否则返回 `409`。
+- 目标前缀等于当前前缀时直接返回当前租约，**不**追加审计事件。
+- 非法前缀（负数、超过地址族长度：IPv4 > 32、IPv6 > 128）返回 `422`。
+- 成功后 **token 与到期时间不变**；过期清理、冲突检查、网段更新与追加
+  `resize` 审计事件都在**同一个 `BEGIN IMMEDIATE` 事务**内完成，
+  失败整体回滚、不留事件。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -49,6 +64,7 @@ docker compose up -d --build
 | GET | `/leases/{token}` | 查询单个租约 |
 | POST | `/leases/{token}/renew` | 续租 |
 | POST | `/leases/{token}/release` | 主动释放 |
+| PUT | `/leases/{token}/resize` | 原地缩/扩容（仅活动租约） |
 | GET | `/audit/events` | 按 `seq` 升序列出租约审计事件 |
 | GET | `/audit/verify` | 校验审计链，返回 `valid` 与首个 `invalid_seq` |
 
@@ -88,6 +104,14 @@ curl -s -X POST http://localhost:8000/leases/<TOKEN>/renew \
 # 6) 主动释放（网段立即回到空闲空间，旧令牌此后返回 409）
 curl -s -X POST http://localhost:8000/leases/<TOKEN>/release
 
+# 6b) 原地扩容 /27 → /26（唯一包住当前网段的超网；token 与到期时间不变）
+curl -s -X PUT http://localhost:8000/leases/<TOKEN>/resize \
+  -H 'Content-Type: application/json' -d '{"target_prefix_len":26}'
+
+# 6c) 原地缩容 /27 → /29（保留低地址子网，其余空间回到池中）
+curl -s -X PUT http://localhost:8000/leases/<TOKEN>/resize \
+  -H 'Content-Type: application/json' -d '{"target_prefix_len":29}'
+
 # 7) 查看审计链：allocate → renew → release 各一条事件
 curl -s http://localhost:8000/audit/events
 
@@ -110,7 +134,7 @@ curl -s -X POST http://localhost:8000/pools/2/leases \
 
 ## 租约审计链
 
-租约**分配、续租、释放、过期回收**成功时，会在**同一个 `BEGIN IMMEDIATE`
+租约**分配、续租、释放、过期回收、缩扩容**成功时，会在**同一个 `BEGIN IMMEDIATE`
 事务**内向 `audit_events` 表追加一条事件；操作失败（409/422/404 等）事务回滚，
 **不会留下任何事件**。
 
@@ -119,11 +143,11 @@ curl -s -X POST http://localhost:8000/pools/2/leases \
 | 字段 | 说明 |
 |---|---|
 | `seq` | 从 1 开始连续递增的序号（写锁内分配，并发安全） |
-| `action` | `allocate` / `renew` / `release` / `expire` |
+| `action` | `allocate` / `renew` / `release` / `expire` / `resize` |
 | `lease_id` / `pool_id` | 租约与地址池标识 |
-| `cidr` | 租约网段 |
+| `cidr` | 租约网段（`resize` 事件为变更后的网段） |
 | `occurred_at` | 事件时间（Unix 秒） |
-| `details` | 详情 JSON（如 `prefix_len`、`ttl_seconds`、`expires_at`） |
+| `details` | 详情 JSON（如 `prefix_len`、`ttl_seconds`、`expires_at`；`resize` 事件记录 `before_cidr` / `after_cidr`） |
 | `prev_hash` | 上一条事件的 `hash`；首条为 64 个 `0` |
 | `hash` | 本事件摘要 |
 
@@ -152,7 +176,10 @@ pytest -q
 测试覆盖：最小起始地址分配、空闲合并表示、保留段冲突、越界/族不一致/非规范拒绝、
 空间耗尽 409、续租、释放、TTL 过期回收、旧令牌 409、IPv6，以及 12 线程并发申请
 `/29` 池中 8 个 `/32`（恰好 8 个成功且互不重叠，其余 409）。
-审计链覆盖：四类事件记录与哈希链接、失败操作不记录、过期回收事件、
+缩扩容覆盖：缩容保留低地址子网且 token/到期时间不变、扩容取唯一超网、
+扩容与活动租约/保留段/池边界冲突 409、非法前缀 422、同前缀幂等不写事件、
+非活动租约 409、IPv6 双向调整。
+审计链覆盖：五类事件记录与哈希链接、失败操作不记录、过期回收事件、
 空链有效，以及篡改事件内容 / 破坏 `prev_hash` 链接时 `verify` 能定位首个失效 `seq`。
 另已在 `uvicorn --workers 2` 多进程部署下验证 32 并发分配 `/24` 池中的 `/28`
 （16 个成功、块唯一且不重叠）。
